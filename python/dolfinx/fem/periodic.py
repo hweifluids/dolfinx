@@ -1,7 +1,7 @@
 # This file is part of DOLFINx (https://www.fenicsproject.org)
 #
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Periodic Cartesian constraints and projected flow on hexahedral meshes."""
+"""Periodic constraints and projected flow on Cartesian meshes."""
 
 from __future__ import annotations
 
@@ -22,8 +22,13 @@ if TYPE_CHECKING:
     import cupy as cp
     from scipy.sparse import csr_matrix
 
+    from dolfinx.fem._periodic_cuda import DualCudaFlow, _Parts
+
 
 __all__ = ["PeriodicDofMap", "PeriodicIncompressibleProblem"]
+
+if TYPE_CHECKING:
+    _Velocity = npt.NDArray[np.float64] | cp.ndarray | _Parts
 
 
 class PeriodicDofMap:
@@ -44,10 +49,10 @@ class PeriodicDofMap:
         """Build a map for the given nodal space and periodic grid.
 
         Args:
-            space: Complete nodal space on a serial, three-dimensional mesh.
+            space: Complete nodal space on the serial 3D mesh.
             shape: Number of distinct periodic nodes along each axis.
             lower: Coordinates of the lower corner of the grid.
-            upper: Coordinates of the opposite corner of the grid.
+            upper: Opposite corner of the grid.
         """
         shape = tuple(shape)
         extent = np.asarray(upper, dtype=np.float64) - np.asarray(lower, dtype=np.float64)
@@ -94,7 +99,7 @@ class PeriodicDofMap:
         self._canonical_nodes[self.node_indices[canonical]] = canonical
 
     def restrict(self, values: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
-        """Read each periodic coefficient from the grid with the upper endpoints omitted."""
+        """Read periodic coefficients with upper endpoints omitted."""
         if values.shape != self.indices.shape:
             raise ValueError("Expected a flat vector in the original DOF layout.")
         return values.reshape(-1, self.block_size)[self._canonical_nodes].ravel()
@@ -173,7 +178,7 @@ def _inverse_symbol(
     if np.min(spectrum) <= 1e-13 * scale:
         raise ValueError("The pressure operator has an unexpected null or negative mode.")
 
-    # Check that the assembled pressure operator is periodic away from the impulse.
+    # Compare the FFT action to the assembled operator on a sample.
     sample = np.random.default_rng(71).standard_normal(impulse.size)
     direct = divergence @ (inverse_mass * (gradient @ sample))
     transformed = np.fft.irfftn(
@@ -185,15 +190,51 @@ def _inverse_symbol(
     return inverse
 
 
+def _solve_pressure(rhs, inverse_symbol, shape, xp):
+    return xp.fft.irfftn(
+        xp.fft.rfftn(rhs.reshape(shape)) * inverse_symbol,
+        s=shape,
+        axes=(0, 1, 2),
+    ).ravel()
+
+
+def _apply(operation, *vectors):
+    return operation(*vectors)
+
+
+def _rk4(velocity, dt, derivative, apply):
+    k1 = derivative(velocity)
+    k2 = derivative(apply(lambda u, k: u + 0.5 * dt * k, velocity, k1))
+    k3 = derivative(apply(lambda u, k: u + 0.5 * dt * k, velocity, k2))
+    k4 = derivative(apply(lambda u, k: u + dt * k, velocity, k3))
+    return apply(
+        lambda u, a, b, c, d: u + (dt / 6) * (a + 2 * b + 2 * c + d),
+        velocity,
+        k1,
+        k2,
+        k3,
+        k4,
+    )
+
+
 class PeriodicIncompressibleProblem:
-    """Advance a periodic Q2/Q1 flow with lumped mass and a pressure projection.
+    """Advance periodic Q2/Q1 flow with lumped mass and projection.
 
     The user supplies a momentum load as a UFL form compiled by FFCx. The
     solver applies its negative mass-weighted residual and projects each
-    classical RK4 stage using the assembled divergence and an FFT inverse
-    of the pressure Schur complement. The method requires FP64, one MPI rank,
+    classical RK4 stage with an FFT inverse of the discrete pressure
+    Schur complement. The method requires FP64, one MPI rank,
     a uniform hexahedral box and a single state coefficient in the load.
     The CPU backend uses the supplied Function as coefficient storage.
+
+    With two CUDA devices, velocity and mass are tuples of two FP64
+    arrays in x-slab order. Use distribute and gather for flat host
+    velocity vectors, and weak_divergence to apply the divergence.
+    Pressure and divergence outputs reside on the first CUDA device.
+    The two-device methods complete queued work before returning. Call
+    them from one host thread using the active CUDA stream on each device.
+    For the two-device solver, use weak_divergence in place of the serial
+    divergence matrix attribute.
     """
 
     def __init__(
@@ -206,23 +247,43 @@ class PeriodicIncompressibleProblem:
         lower: tuple[float, float, float],
         upper: tuple[float, float, float],
         backend: Literal["cpu", "cuda"] = "cpu",
+        cuda_devices: tuple[int, int] | None = None,
+        profile_communication: bool = False,
         jit_options: dict | None = None,
     ) -> None:
-        """Assemble the mass and divergence and prepare repeated RHS evaluations.
+        """Assemble operators and prepare repeated RHS evaluations.
 
         Args:
             momentum: Compiled linear form for the velocity residual.
-            state: Function representing the velocity coefficient in the form.
+            state: Function representing the form velocity coefficient.
             pressure_space: Scalar Q1 space on the velocity mesh.
             shape: Number of hexahedral cells along each axis.
             lower: Coordinates of the lower periodic corner.
             upper: Coordinates of the upper periodic corner.
-            backend: DOLFINx CPU assembly or FFCx-generated CUDA assembly on
-                the current CuPy device.
-            jit_options: DOLFINx JIT options, also used for the momentum form.
+            backend: DOLFINx CPU assembly or FFCx-generated CUDA assembly.
+            cuda_devices: Two distinct CUDA device indices, first holding
+                the FFT solve. The default uses the current device.
+            profile_communication: Record two-device copy timings. Call
+                communication_profile to collect and clear the samples.
+            jit_options: DOLFINx JIT options for operator assembly.
         """
         if backend not in ("cpu", "cuda"):
             raise ValueError(f"Unknown periodic flow backend: {backend}.")
+        if cuda_devices is not None:
+            if (
+                backend != "cuda"
+                or len(cuda_devices) != 2
+                or len(set(cuda_devices)) != 2
+                or any(not isinstance(i, int) or i < 0 for i in cuda_devices)
+            ):
+                raise ValueError("Select two distinct nonnegative indices for the CUDA backend.")
+            import cupy as cp
+
+            if max(cuda_devices) >= cp.cuda.runtime.getDeviceCount():
+                raise ValueError("A requested CUDA device is not available.")
+        elif profile_communication:
+            raise ValueError("Communication profiling requires two CUDA devices.")
+        self._dual: DualCudaFlow | None = None
         velocity_space = state.function_space
         if (
             momentum.rank != 1
@@ -270,6 +331,26 @@ class PeriodicIncompressibleProblem:
         inverse_mass = 1 / mass
         symbol = _inverse_symbol(divergence, gradient, inverse_mass, self.pressure_dofs.shape)
         self._cuda_assembler = None
+        if cuda_devices is not None:
+            from dolfinx.fem._periodic_cuda import DualCudaFlow
+
+            self._dual = DualCudaFlow(
+                momentum,
+                state,
+                self.velocity_dofs,
+                self.pressure_dofs,
+                mass,
+                divergence,
+                symbol,
+                cuda_devices,
+                (shape[0] + 1) // 2,
+                jit_options,
+                profile_communication,
+            )
+            self.mass = tuple(slab.mass for slab in self._dual.slabs)
+            self.divergence = None
+            return
+
         if backend == "cuda":
             import cupy as cp
             from cupyx.scipy.sparse import csr_matrix
@@ -294,10 +375,47 @@ class PeriodicIncompressibleProblem:
         self._inverse_mass = self._xp.asarray(inverse_mass)
         self._inverse_symbol = self._xp.asarray(symbol)
 
-    def residual(
-        self, velocity: npt.NDArray[np.float64] | cp.ndarray
-    ) -> npt.NDArray[np.float64] | cp.ndarray:
-        """Assemble the momentum load in the periodic velocity layout."""
+    def distribute(self, velocity: npt.NDArray[np.float64]) -> _Velocity:
+        """Place a flat periodic host velocity on the selected backend."""
+        if self._dual is not None:
+            return self._dual.distribute(velocity)
+        return self._xp.asarray(velocity)
+
+    def gather(self, velocity: _Velocity) -> npt.NDArray[np.float64]:
+        """Return a flat host velocity in periodic Cartesian order."""
+        if self._dual is not None:
+            return self._dual.gather(velocity)
+        return velocity if self.backend == "cpu" else velocity.get()
+
+    def synchronize(self) -> None:
+        """Wait for queued work on the solver devices."""
+        if self._dual is not None:
+            self._dual.synchronize()
+        elif self._cuda_assembler is not None:
+            self._xp.cuda.Device(self._cuda_assembler.device_id).synchronize()
+
+    def communication_profile(self) -> dict:
+        """Return copy samples since the last collection.
+
+        Payload counts describe one projected derivative. Timing totals are
+        grouped by exchange, link and copy leg. Receiver waits can include
+        unfinished remote work. Intervals on two devices may overlap.
+        Enable timing with profile_communication at construction.
+        """
+        if self._dual is None:
+            return {}
+        return self._dual.communication_profile()
+
+    def weak_divergence(self, velocity: _Velocity) -> npt.NDArray[np.float64] | cp.ndarray:
+        """Apply the weak divergence to a periodic velocity."""
+        if self._dual is not None:
+            return self._dual.weak_divergence(velocity)
+        return self.divergence @ velocity
+
+    def residual(self, velocity: _Velocity) -> _Velocity:
+        """Assemble the momentum load in the periodic layout."""
+        if self._dual is not None:
+            return self._dual.residual(velocity)
         if self._cuda_assembler is not None:
             return self._cuda_assembler.assemble((velocity,))
         self._state.x.array[:] = self.velocity_dofs.expand(velocity)
@@ -307,37 +425,38 @@ class PeriodicIncompressibleProblem:
 
     def _correction(self, velocity):
         shape = self.pressure_dofs.shape
-        divergence = (self.divergence @ velocity).reshape(shape)
-        potential = self._xp.fft.irfftn(
-            self._xp.fft.rfftn(divergence) * self._inverse_symbol, s=shape, axes=(0, 1, 2)
-        ).ravel()
+        divergence = self.divergence @ velocity
+        potential = _solve_pressure(divergence, self._inverse_symbol, shape, self._xp)
         return self._inverse_mass * (self._gradient @ potential), potential
 
-    def project(
-        self, velocity: npt.NDArray[np.float64] | cp.ndarray
-    ) -> npt.NDArray[np.float64] | cp.ndarray:
-        """Project a velocity vector onto the discrete divergence-free space."""
+    def project(self, velocity: _Velocity) -> _Velocity:
+        """Project velocity onto the discrete divergence-free space."""
+        if self._dual is not None:
+            return self._dual.project(velocity)
         correction, _ = self._correction(velocity)
         return velocity - correction
 
-    def pressure(
-        self, velocity: npt.NDArray[np.float64] | cp.ndarray
-    ) -> npt.NDArray[np.float64] | cp.ndarray:
-        """Recover the zero-mean pressure for the current velocity."""
+    def pressure(self, velocity: _Velocity) -> npt.NDArray[np.float64] | cp.ndarray:
+        """Recover zero-mean pressure for the current velocity."""
+        if self._dual is not None:
+            return self._dual.pressure(velocity)
         _, potential = self._correction(-self._inverse_mass * self.residual(velocity))
         return -potential
 
     def _derivative(self, velocity):
         return self.project(-self._inverse_mass * self.residual(velocity))
 
-    def step(
-        self, velocity: npt.NDArray[np.float64] | cp.ndarray, dt: float
-    ) -> npt.NDArray[np.float64] | cp.ndarray:
-        """Advance one full RK4 step with pressure projection at each stage."""
+    def step(self, velocity: _Velocity, dt: float) -> _Velocity:
+        """Advance an RK4 step with projection at each stage."""
         if not math.isfinite(dt) or dt <= 0:
             raise ValueError("The time step must be finite and positive.")
-        k1 = self._derivative(velocity)
-        k2 = self._derivative(velocity + 0.5 * dt * k1)
-        k3 = self._derivative(velocity + 0.5 * dt * k2)
-        k4 = self._derivative(velocity + dt * k3)
-        return velocity + (dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+        if self._dual is None:
+            return _rk4(velocity, dt, self._derivative, _apply)
+
+        with self._dual.execution(velocity) as parts:
+            constants = self._dual.constants()
+
+            def derivative(value):
+                return self._dual.derivative(value, constants)
+
+            return _rk4(parts, dt, derivative, self._dual.linear_combination)

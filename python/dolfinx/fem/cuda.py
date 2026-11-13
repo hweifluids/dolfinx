@@ -125,6 +125,7 @@ class VectorAssembler:
         *,
         coefficient_dofs: tuple[npt.NDArray[np.integer] | None, ...] | None = None,
         test_dofs: npt.NDArray[np.integer] | None = None,
+        cells: npt.NDArray[np.integer] | None = None,
         jit_options: dict | None = None,
     ) -> None:
         """Prepare index maps and compile CUDA kernels for a fixed form.
@@ -135,6 +136,8 @@ class VectorAssembler:
                 order. Supply device arrays in the same order.
             coefficient_dofs: Input index maps in UFCx coefficient order.
             test_dofs: Optional output index map for the test space.
+            cells: Optional subset of owned local cells. The assembler
+                intersects this subset with each integration domain.
             jit_options: DOLFINx JIT options used to create the form.
         """
         import cupy as cp
@@ -155,6 +158,19 @@ class VectorAssembler:
             for function, expected in zip(coefficients, cpp_coefficients, strict=True)
         ):
             raise ValueError("Pass the form's coefficient functions in UFCx order.")
+
+        if cells is not None:
+            cells = np.asarray(cells)
+            topology = form.mesh.topology
+            num_cells = topology.index_map(topology.dim).size_local
+            if (
+                cells.ndim != 1
+                or not np.issubdtype(cells.dtype, np.integer)
+                or np.any(cells < 0)
+                or np.any(cells >= num_cells)
+                or np.unique(cells).size != cells.size
+            ):
+                raise ValueError("Expected distinct owned local cell indices.")
 
         self._cp = cp
         self._form = form
@@ -207,8 +223,10 @@ class VectorAssembler:
 
         original_kernels = None
         for index in range(cell_count):
-            cells = form._cpp_object.domains(IntegralType.cell, index)
-            count = len(cells)
+            domain = form._cpp_object.domains(IntegralType.cell, index)
+            if cells is not None:
+                domain = domain[np.isin(domain, cells)]
+            count = len(domain)
             if not count:
                 continue
             kernel, data = None, coordinates
@@ -254,9 +272,9 @@ class VectorAssembler:
                     blocks,
                     threads,
                     count,
-                    cp.asarray(indices[cells]),
-                    cp.asarray(data[cells]),
-                    tuple(cp.asarray(mapping[cells]) for mapping in coefficient_indices),
+                    cp.asarray(indices[domain]),
+                    cp.asarray(data[domain]),
+                    tuple(cp.asarray(mapping[domain]) for mapping in coefficient_indices),
                 )
             )
 
