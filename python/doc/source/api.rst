@@ -13,6 +13,8 @@ Public user interface
 
    dolfinx.common
    dolfinx.fem
+   dolfinx.fem.cuda
+   dolfinx.fem.periodic
    dolfinx.fem.petsc
    dolfinx.fem.problems
    dolfinx.geometry
