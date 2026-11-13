@@ -62,6 +62,7 @@ class Form(typing.Generic[Scalar]):
     _mesh: Mesh
     _spaces: tuple[FunctionSpace, ...]
     _code: str | list[str] | None
+    _ufl_data: tuple[ufl.Form, dict] | None = None
 
     def __init__(
         self,
@@ -518,7 +519,11 @@ def form(
             _entity_maps,
             typing.cast(typing.Any, msh._cpp_object),
         )
-        return Form(f, msh, spaces, ufcx_form, code, module)
+        compiled = Form(f, msh, spaces, ufcx_form, code, module)
+        if len(form.arguments()) == 1 and np.dtype(dtype) == np.float64:
+            # CUDA assembly can lower the same UFL integrand on demand.
+            compiled._ufl_data = (form, dict(form_compiler_options))
+        return compiled
 
     def _zero_form(form: ufl.ZeroBaseForm) -> Form:
         """Compile a single 'zero' UFL form.

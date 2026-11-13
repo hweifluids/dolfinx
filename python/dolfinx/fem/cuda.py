@@ -5,20 +5,32 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import numpy.typing as npt
 
 from dolfinx import jit
 from dolfinx.fem import Form, Function, FunctionSpace, IntegralType, pack_constants
+from dolfinx.mesh import CellType
 
 if TYPE_CHECKING:
     import cupy as cp
 
 __all__ = ["VectorAssembler"]
+
+
+class _Launch(NamedTuple):
+    kernel: cp.RawKernel
+    blocks: int
+    threads: int
+    count: int
+    dofs: cp.ndarray
+    geometry: cp.ndarray
+    maps: tuple[cp.ndarray, ...]
 
 
 def _cell_kernels(source: str) -> list[tuple[str, str]]:
@@ -52,15 +64,54 @@ def _cell_kernels(source: str) -> list[tuple[str, str]]:
     return kernels
 
 
+def _cell_wrapper(
+    name: str, widths: tuple[int, ...], output_width: int, coordinate_width: int
+) -> str:
+    """Wrap the UFCx cell kernel with device gathers and scatters."""
+    arguments = []
+    gather = []
+    offset = 0
+    for i, width in enumerate(widths):
+        arguments.extend((f"const int* map{i}", f"const double* coefficient{i}"))
+        gather.append(
+            f"for (int j = 0; j < {width}; ++j)\n"
+            f"        w[{offset} + j] = coefficient{i}[map{i}[cell * {width} + j]];"
+        )
+        offset += width
+    coefficient_args = "".join(f", {argument}" for argument in arguments)
+    coefficient_loads = "\n    ".join(gather)
+    return f"""
+extern "C" __global__ void assemble_vector(
+    int count, const int* dofs, const double* coordinates,
+    const double* constants, double* output{coefficient_args})
+{{
+    const int cell = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cell >= count)
+        return;
+    double w[{max(offset, 1)}];
+    double local[{output_width}] = {{}};
+    {coefficient_loads}
+    {name}(local, w, constants, coordinates + cell * {coordinate_width},
+        nullptr, nullptr, nullptr);
+    for (int j = 0; j < {output_width}; ++j)
+        atomicAdd(output + dofs[cell * {output_width} + j], local[j]);
+}}
+"""
+
+
 class VectorAssembler:
-    """Evaluate an FFCx linear form and assemble its vector on one CUDA device.
+    """Assemble an FFCx linear form's vector on one CUDA device.
 
     The form uses real FP64, cell integrals and one mesh on a serial MPI
     communicator. Test and coefficient elements must have dofmaps that
     encode their local ordering without additional DOF transformations.
     Every generated integral must have a cell integration domain.
-    Mesh coordinates, cell domains and index maps are fixed at construction.
-    Pass device arrays for the current coefficient values at each call.
+    Mesh coordinates, domains and index maps are fixed at construction.
+    Pass current coefficient values in device arrays.
+
+    Supported nodal quadrilateral and hexahedral forms use staged tensor
+    contractions generated from FFCx's quadrature tables and integrand.
+    Other forms use the original UFCx cell kernel on CUDA.
 
     Optional DOF maps associate each unrolled DOLFINx DOF with an index
     in the device vector. A many-to-one map assembles directly into a
@@ -81,8 +132,8 @@ class VectorAssembler:
         Args:
             form: Compiled rank-one FFCx form.
             coefficients: DOLFINx functions in the form's UFCx coefficient
-                order. The arrays supplied to assemble follow the same order.
-            coefficient_dofs: Optional input index maps in UFCx coefficient order.
+                order. Supply device arrays in the same order.
+            coefficient_dofs: Input index maps in UFCx coefficient order.
             test_dofs: Optional output index map for the test space.
             jit_options: DOLFINx JIT options used to create the form.
         """
@@ -124,65 +175,88 @@ class VectorAssembler:
         coordinate_width = coordinates.shape[1] * coordinates.shape[2]
         output_width = indices.shape[1]
 
-        code = form.code
-        source = code if isinstance(code, str) else "\n".join(part for part in code or () if part)
-        if not source:
-            cache = Path(jit.get_options(jit_options)["cache_dir"])
-            source = (cache / (form.module.__name__ + ".c")).read_text(encoding="utf-8")
-        kernels = _cell_kernels(source)
-        # Only cell integrals are supported by this launch wrapper.
         cell_count = form.ufcx_form.form_integral_offsets[1]
-        if len(kernels) != cell_count or cell_count != form.num_integrals(IntegralType.cell, 0):
+        if cell_count != form.num_integrals(IntegralType.cell, 0):
             raise ValueError("Expected every generated integral to have a cell integration domain.")
 
-        for index, (name, function) in enumerate(kernels):
-            cells = form._cpp_object.domains(IntegralType.cell, index)
-            if len(cells) == 0:
-                continue
-            gather = []
-            arguments = []
-            device_maps = []
-            offset = 0
-            for i, coefficient_map in enumerate(coefficient_indices):
-                width = coefficient_map.shape[1]
-                arguments.extend((f"const int* map{i}", f"const double* coefficient{i}"))
-                gather.append(
-                    f"for (int j = 0; j < {width}; ++j)\n"
-                    f"        w[{offset} + j] = coefficient{i}[map{i}[cell * {width} + j]];"
-                )
-                device_maps.append(cp.asarray(coefficient_map[cells]))
-                offset += width
-            coefficient_args = "".join(f", {argument}" for argument in arguments)
-            coefficient_loads = "\n    ".join(gather)
-            wrapper = f"""
-extern "C" __global__ void assemble_vector(
-    int count, const int* dofs, const double* coordinates,
-    const double* constants, double* output{coefficient_args})
-{{
-    const int cell = blockIdx.x * blockDim.x + threadIdx.x;
-    if (cell >= count)
-        return;
-    double w[{max(offset, 1)}];
-    double local[{output_width}] = {{}};
-    {coefficient_loads}
-    {name}(local, w, constants, coordinates + cell * {coordinate_width},
-        nullptr, nullptr, nullptr);
-    for (int j = 0; j < {output_width}; ++j)
-        atomicAdd(output + dofs[cell * {output_width} + j], local[j]);
-}}
-"""
-            module = cp.RawModule(
-                code="using uint8_t = unsigned char;\n" + function + wrapper,
-                options=("--std=c++17", "--fmad=false"),
+        widths = tuple(mapping.shape[1] for mapping in coefficient_indices)
+        tensor_kernels = {}
+        jacobians = None
+        if form._ufl_data is not None and form.mesh.topology.cell_type in (
+            CellType.quadrilateral,
+            CellType.hexahedron,
+        ):
+            from dolfinx.fem import _cuda_tensor
+
+            expression, options = form._ufl_data
+            jacobians = _cuda_tensor.affine_jacobians(expression, coordinates)
+            tensor_kernels = _cuda_tensor.kernels(
+                expression,
+                options,
+                tuple(form.ufcx_form.form_integral_ids[i] for i in range(cell_count)),
+                tuple(form.ufcx_form.original_coefficient_positions[i] for i in range(len(widths))),
+                widths,
+                output_width,
+                coordinate_width,
+                None if jacobians is None else jacobians.shape[1] * jacobians.shape[2],
+                min(
+                    48 * 1024,
+                    cp.cuda.runtime.getDeviceProperties(self.device_id)["sharedMemPerBlock"],
+                ),
             )
-            kernel = module.get_function("assemble_vector")
+
+        original_kernels = None
+        for index in range(cell_count):
+            cells = form._cpp_object.domains(IntegralType.cell, index)
+            count = len(cells)
+            if not count:
+                continue
+            kernel, data = None, coordinates
+            if candidate := tensor_kernels.get(index):
+                tensor, use_jacobians = candidate
+                try:
+                    kernel = cp.RawModule(
+                        code=tensor.source, options=("--std=c++17", "--fmad=true")
+                    ).get_function("assemble_vector")
+                except cp.cuda.compiler.CompileException:
+                    logging.getLogger(__name__).debug(
+                        "The CUDA tensor kernel did not compile.", exc_info=True
+                    )
+                else:
+                    blocks, threads = count, tensor.threads
+                    if use_jacobians:
+                        data = jacobians
+            if kernel is None:
+                if original_kernels is None:
+                    code = form.code
+                    source = (
+                        code
+                        if isinstance(code, str)
+                        else "\n".join(part for part in code or () if part)
+                    )
+                    if not source:
+                        cache = Path(jit.get_options(jit_options)["cache_dir"])
+                        source = (cache / (form.module.__name__ + ".c")).read_text(encoding="utf-8")
+                    original_kernels = _cell_kernels(source)
+                    if len(original_kernels) != cell_count:
+                        raise ValueError("Expected one UFCx kernel per cell integration domain.")
+                name, function = original_kernels[index]
+                wrapper = _cell_wrapper(name, widths, output_width, coordinate_width)
+                kernel = cp.RawModule(
+                    code="using uint8_t = unsigned char;\n" + function + wrapper,
+                    options=("--std=c++17", "--fmad=false"),
+                ).get_function("assemble_vector")
+                threads = 128
+                blocks = (count + threads - 1) // threads
             self._kernels.append(
-                (
+                _Launch(
                     kernel,
-                    len(cells),
+                    blocks,
+                    threads,
+                    count,
                     cp.asarray(indices[cells]),
-                    cp.asarray(coordinates[cells]),
-                    tuple(device_maps),
+                    cp.asarray(data[cells]),
+                    tuple(cp.asarray(mapping[cells]) for mapping in coefficient_indices),
                 )
             )
 
@@ -238,12 +312,12 @@ extern "C" __global__ void assemble_vector(
     def assemble(
         self, coefficients: tuple[cp.ndarray, ...], *, constants: cp.ndarray | None = None
     ) -> cp.ndarray:
-        """Return a CUDA vector assembled from the current coefficient arrays.
+        """Assemble a CUDA vector from the current coefficient arrays.
 
         Args:
-            coefficients: Contiguous FP64 device vectors in UFCx coefficient order.
-            constants: Packed FP64 device constants. If omitted, the library
-                uploads the current constants from the DOLFINx form.
+            coefficients: FP64 contiguous GPU vectors in UFCx order.
+            constants: Packed FP64 device constants. By default, upload
+                the current constants from the DOLFINx form.
 
         Returns:
             The assembled vector on the device that owns the form data.
@@ -258,11 +332,10 @@ extern "C" __global__ void assemble_vector(
             constants = self._cp.asarray(pack_constants(self._form))
         self._check_array(constants, self._num_constants, "Packed constants")
         output = self._cp.zeros(self.size, dtype=np.float64)
-        threads = 128
-        for kernel, count, dofs, geometry, maps in self._kernels:
+        for kernel, blocks, threads, count, dofs, geometry, maps in self._kernels:
             data = tuple(value for pair in zip(maps, coefficients, strict=True) for value in pair)
             kernel(
-                ((count + threads - 1) // threads,),
+                (blocks,),
                 (threads,),
                 (np.int32(count), dofs, geometry, constants, output, *data),
             )
